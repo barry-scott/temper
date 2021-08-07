@@ -29,14 +29,7 @@ import re
 import select
 import struct
 import sys
-
-# Non-standard modules
-try:
-  import serial
-except ImportError:
-  print('Cannot import "serial". Please sudo apt-get install python3-serial')
-  sys.exit(1)
-
+import time
 
 class USBList(object):
   '''Get a list of all of the USB devices on a system, along with their
@@ -107,11 +100,12 @@ class USBList(object):
 class USBRead(object):
   '''Read temperature and/or humidity information from a specified USB device.
   '''
-  def __init__(self, device, verbose=False):
+  def __init__(self, device, verbose=False, debug=False):
     self.device = device
     self.verbose = verbose
+    self.debug = debug
 
-  def _parse_bytes(self, name, offset, divisor, bytes, info):
+  def _parse_response(self, name, offset, divisor, response, info):
     '''Data is returned from several devices in a similar format. In the first
     8 bytes, the internal sensors are returned in bytes 2 and 3 (temperature)
     and in bytes 4 and 5 (humidity). In the second 8 bytes, external sensor
@@ -124,98 +118,111 @@ class USBRead(object):
     value is found.
     '''
     try:
-      if bytes[offset] == 0x4e and bytes[offset+1] == 0x20:
+      if response[offset] == 0x4e and response[offset+1] == 0x20:
         return
     except:
       return
     try:
-      info[name] = struct.unpack_from('>h', bytes, offset)[0] / divisor
+      info[name] = struct.unpack_from('>h', response, offset)[0] / divisor
     except:
       return
 
-  def _read_hidraw_firmware(self, fd, verbose = False):
-    ''' Get firmware identifier'''
-    query = struct.pack('8B', 0x01, 0x86, 0xff, 0x01, 0, 0, 0, 0)
-    if verbose:
-      print('Firmware query: %s' % binascii.b2a_hex(query))
-
+  def _read_query_response(self, fd, query, response_size, response_size_min=None, retries=1):
     # Sometimes we don't get all of the expected information from the
     # device.  We'll retry a few times and hope for the best.
     # See: https://github.com/urwen/temper/issues/9
-    for i in range(0, 10):
+    st = time.time()
+
+    if response_size_min is None:
+      response_size_min = response_size
+
+    for i in range(0, retries):
+      if self.debug: print('_read_query_response: %.6f try %d query %s(%r)' %
+                            (time.time()-st, i, binascii.b2a_hex(query), query))
       os.write(fd, query)
 
-      firmware = b''
-      while True:
-        r, _, _ = select.select([fd], [], [], 0.2)
-        if fd not in r:
+      response = b''
+      timeout = 10.0
+      while len(response) != response_size:
+        if self.debug: print('_read_query_response: timeout %.3f' % (timeout,))
+        r, _, _ = select.select([fd], [], [], timeout)
+        if response_size != response_size_min:
+          # TEMPer2 takes 64ms typiclly to supply the optional extra data
+          timeout = 0.100
+
+        # is it a timeout?
+        if len(r) == 0:
           break
+
+        # data comes back in 8 byte chunks
         data = os.read(fd, 8)
-        firmware += data
+        if self.debug: print('_read_query_response: %.6f     data %d %s(%r)' %
+                          (time.time()-st, len(data), binascii.b2a_hex(data), data))
+        response += data
+        if self.debug: print('_read_query_response: %.6f response %d %s(%r)' %
+                          (time.time()-st, len(response), binascii.b2a_hex(response), response))
 
-      if not len(firmware):
-        os.close(fd)
-        raise RuntimeError('Cannot read device firmware identifier')
+      if len(response) >= response_size_min:
+        return response
 
-      if len(firmware) > 8:
-        break
-
-    if verbose:
-      print('Firmware value: %s %s' %(binascii.b2a_hex(firmware), firmware.decode()))
-
-    return firmware
+    raise RuntimeError('Cannot read device response')
 
   def _read_hidraw(self, device):
     '''Using the Linux hidraw device, send the special commands and receive the
-    raw data. Then call '_parse_bytes' based on the firmware version to provide
+    raw data. Then call '_parse_response' based on the firmware version to provide
     temperature and humidity information.
 
     A dictionary of temperature and humidity info is returned.
     '''
     path = os.path.join('/dev', device)
-    fd = os.open(path, os.O_RDWR)
+    # open O_NONBLOCK to prevent os.read/os.write from blocking
+    # select is used to wait for data
+    fd = os.open(path, os.O_RDWR|os.O_NONBLOCK)
 
-    firmware = self._read_hidraw_firmware(fd, self.verbose)
+    query = struct.pack('8B', 0x01, 0x86, 0xff, 0x01, 0, 0, 0, 0)
+    firmware = self._read_query_response(fd, query, 16, retries=10)
+
+    if self.verbose:
+      print('Firmware query: %s' % binascii.b2a_hex(query))
+      print('Firmware value: %s %s' %(binascii.b2a_hex(firmware), firmware.decode()))
 
     # Get temperature/humidity
-    os.write(fd, struct.pack('8B', 0x01, 0x80, 0x33, 0x01, 0, 0, 0, 0))
-    bytes = b''
-    while True:
-      r, _, _ = select.select([fd], [], [], 0.1)
-      if fd not in r:
-        break
-      data = os.read(fd, 8)
-      bytes += data
+    query = struct.pack('8B', 0x01, 0x80, 0x33, 0x01, 0, 0, 0, 0)
+    # response is 8 bytes/sensor.
+    # The only way to know if the external sensor is present is to wait
+    # for its 8 bytes of data. The _read_query_response will timeout if
+    # we pass a response_size_min=8 when the external data is missing
+    response = self._read_query_response(fd, query, response_size=16, response_size_min=8)
 
     os.close(fd)
     if self.verbose:
-      print('Data value: %s' % binascii.hexlify(bytes))
+      print('Data value: %s' % binascii.hexlify(response))
 
     info = dict()
     info['firmware'] = str(firmware, 'latin-1').strip()
     info['hex_firmware'] = str(binascii.b2a_hex(firmware), 'latin-1')
-    info['hex_data'] = str(binascii.b2a_hex(bytes), 'latin-1')
+    info['hex_data'] = str(binascii.b2a_hex(response), 'latin-1')
 
     if info['firmware'][:10] in [ 'TEMPerF1.4', 'TEMPer1F1.' ]:
       info['firmware'] = info['firmware'][:10]
-      self._parse_bytes('internal temperature', 2, 256.0, bytes, info)
+      self._parse_response('internal temperature', 2, 256.0, response, info)
       return info
 
     if info['firmware'][:15] == 'TEMPerGold_V3.1':
       info['firmware'] = info['firmware'][:15]
-      self._parse_bytes('internal temperature', 2, 100.0, bytes, info)
+      self._parse_response('internal temperature', 2, 100.0, response, info)
       return info
 
     if info['firmware'][:12] in [ 'TEMPerX_V3.1', 'TEMPerX_V3.3' ]:
       info['firmware'] = info['firmware'][:12]
-      self._parse_bytes('internal temperature', 2, 100.0, bytes, info)
-      self._parse_bytes('internal humidity', 4, 100.0, bytes, info)
-      self._parse_bytes('external temperature', 10, 100.0, bytes, info)
-      self._parse_bytes('external humidity', 12, 100.0, bytes, info)
+      self._parse_response('internal temperature', 2, 100.0, response, info)
+      self._parse_response('internal humidity', 4, 100.0, response, info)
+      self._parse_response('external temperature', 10, 100.0, response, info)
+      self._parse_response('external humidity', 12, 100.0, response, info)
       return info
 
     info['error'] = 'Unknown firmware %s: %s' % (info['firmware'],
-                                                 binascii.hexlify(bytes))
+                                                 binascii.hexlify(response))
     return info
 
   def _read_serial(self, device):
@@ -225,6 +232,8 @@ class USBRead(object):
     A dictionary of device info (like that returned by USBList) combined with
     temperature and humidity info is returned.
     '''
+
+    import serial
 
     path = os.path.join('/dev', device)
     s = serial.Serial(path, 9600)
@@ -268,19 +277,22 @@ class USBRead(object):
     # Use the last device found
     if self.device.startswith('hidraw'):
       return self._read_hidraw(self.device)
+
     if self.device.startswith('tty'):
       return self._read_serial(self.device)
+
     return {'error': 'No usable hid/tty devices available'}
 
 class Temper(object):
   SYSPATH = '/sys/bus/usb/devices'
 
-  def __init__(self, verbose=False):
+  def __init__(self, verbose=False, debug=False):
     usblist = USBList()
     self.usb_devices = usblist.get_usb_devices()
     self.forced_vendor_id = None
     self.forced_product_id = None
     self.verbose = verbose
+    self.debug = debug
 
   def _is_known_id(self, vendorid, productid):
     '''Returns True if the vendorid and product id are valid.
@@ -322,7 +334,7 @@ class Temper(object):
         info.get('product', '???'),
         list(info['devices']) if len(info['devices']) > 0 else ''))
 
-  def read(self, verbose=False):
+  def read(self):
     '''Read all of the known devices on the system and return a list of
     dictionaries which contain the device information, firmware information,
     and environmental information obtained. If there is an error, then the
@@ -339,7 +351,7 @@ class Temper(object):
         info['error'] = 'no hid/tty devices available'
         results.append(info)
         continue
-      usbread = USBRead(info['devices'][-1], verbose)
+      usbread = USBRead(info['devices'][-1], self.verbose, self.debug)
       results.append({ **info, **usbread.read() })
     return results
 
@@ -401,8 +413,11 @@ class Temper(object):
                         metavar=('VENDOR_ID:PRODUCT_ID'))
     parser.add_argument('--verbose', action='store_true',
                         help='Output binary data from thermometer')
+    parser.add_argument('--debug', action='store_true',
+                        help='Turn on debug')
     args = parser.parse_args()
     self.verbose = args.verbose
+    self.debug = args.debug
 
     if args.list:
       self.list(args.json)
@@ -423,7 +438,7 @@ class Temper(object):
       self.forced_product_id = product_id;
 
     # By default, output the temperature and humidity for all known sensors.
-    results = self.read(args.verbose)
+    results = self.read()
     self.print(results, args.json)
     return 0
 
